@@ -1,61 +1,44 @@
 using System;
-using System.Data.Common;
-using System.Linq;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using Amazon.DynamoDBv2;
+using Amazon.DynamoDBv2.DocumentModel;
+using Amazon.DynamoDBv2.Model;
 using Newtonsoft.Json;
-using Npgsql;
-using StackExchange.Redis;
 
 namespace Worker
 {
     public class Program
     {
+        private static readonly string TableName = "votes"; // DynamoDB table name
+        private static readonly string Region = "eu-west-1"; // Specify your AWS region
+
         public static int Main(string[] args)
         {
             try
             {
-                var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
-                var redisConn = OpenRedisConnection("redis");
-                var redis = redisConn.GetDatabase();
+                var dynamoDbClient = OpenDynamoDbClient();
+                EnsureTableExists(dynamoDbClient, TableName);
 
-                // Keep alive is not implemented in Npgsql yet. This workaround was recommended:
-                // https://github.com/npgsql/npgsql/issues/1214#issuecomment-235828359
-                var keepAliveCommand = pgsql.CreateCommand();
-                keepAliveCommand.CommandText = "SELECT 1";
-
-                var definition = new { vote = "", voter_id = "" };
+                // Continuously monitor the SQS queue for incoming messages
                 while (true)
                 {
-                    // Slow down to prevent CPU spike, only query each 100ms
+                    // Slow down to prevent CPU spikes, only query each 100ms
                     Thread.Sleep(100);
 
-                    // Reconnect redis if down
-                    if (redisConn == null || !redisConn.IsConnected) {
-                        Console.WriteLine("Reconnecting Redis");
-                        redisConn = OpenRedisConnection("redis");
-                        redis = redisConn.GetDatabase();
-                    }
-                    string json = redis.ListLeftPopAsync("votes").Result;
-                    if (json != null)
+                    var message = GetSqsMessage(); // Replace with your SQS message fetching logic
+                    if (message != null)
                     {
-                        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
-                        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
-                        // Reconnect DB if down
-                        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
-                        {
-                            Console.WriteLine("Reconnecting DB");
-                            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
-                        }
-                        else
-                        { // Normal +1 vote requested
-                            UpdateVote(pgsql, vote.voter_id, vote.vote);
-                        }
-                    }
-                    else
-                    {
-                        keepAliveCommand.ExecuteNonQuery();
+                        var vote = JsonConvert.DeserializeObject<Vote>(message);
+                        Console.WriteLine($"Processing vote for '{vote.Vote}' by '{vote.VoterId}'");
+                        
+                        // Update the vote in DynamoDB
+                        UpdateVote(dynamoDbClient, vote.VoterId, vote.Vote);
+                        
+                        // Delete the message from SQS after processing
+                        DeleteSqsMessage(message); // Replace with your SQS message deletion logic
                     }
                 }
             }
@@ -66,89 +49,102 @@ namespace Worker
             }
         }
 
-        private static NpgsqlConnection OpenDbConnection(string connectionString)
+        private static AmazonDynamoDBClient OpenDynamoDbClient()
         {
-            NpgsqlConnection connection;
-
-            while (true)
-            {
-                try
-                {
-                    connection = new NpgsqlConnection(connectionString);
-                    connection.Open();
-                    break;
-                }
-                catch (SocketException)
-                {
-                    Console.Error.WriteLine("Waiting for db");
-                    Thread.Sleep(1000);
-                }
-                catch (DbException)
-                {
-                    Console.Error.WriteLine("Waiting for db");
-                    Thread.Sleep(1000);
-                }
-            }
-
-            Console.Error.WriteLine("Connected to db");
-
-            var command = connection.CreateCommand();
-            command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
-                                        id VARCHAR(255) NOT NULL UNIQUE,
-                                        vote VARCHAR(255) NOT NULL
-                                    )";
-            command.ExecuteNonQuery();
-
-            return connection;
+            // Create a new DynamoDB client
+            return new AmazonDynamoDBClient(Amazon.RegionEndpoint.GetBySystemName(Region));
         }
 
-        private static ConnectionMultiplexer OpenRedisConnection(string hostname)
+        private static void EnsureTableExists(AmazonDynamoDBClient client, string tableName)
         {
-            // Use IP address to workaround https://github.com/StackExchange/StackExchange.Redis/issues/410
-            var ipAddress = GetIp(hostname);
-            Console.WriteLine($"Found redis at {ipAddress}");
-
-            while (true)
+            // Check if the table exists
+            var tables = client.ListTablesAsync().Result;
+            if (!tables.TableNames.Contains(tableName))
             {
-                try
+                // Create the DynamoDB table
+                var request = new CreateTableRequest
                 {
-                    Console.Error.WriteLine("Connecting to redis");
-                    return ConnectionMultiplexer.Connect(ipAddress);
-                }
-                catch (RedisConnectionException)
-                {
-                    Console.Error.WriteLine("Waiting for redis");
-                    Thread.Sleep(1000);
-                }
+                    TableName = tableName,
+                    KeySchema = new List<KeySchemaElement>
+                    {
+                        new KeySchemaElement("PK", KeyType.HASH),  // Partition key
+                        new KeySchemaElement("SK", KeyType.RANGE)  // Sort key
+                    },
+                    AttributeDefinitions = new List<AttributeDefinition>
+                    {
+                        new AttributeDefinition("PK", ScalarAttributeType.S),
+                        new AttributeDefinition("SK", ScalarAttributeType.S)
+                    },
+                    ProvisionedThroughput = new ProvisionedThroughput(5, 5) // Adjust capacity as needed
+                };
+                
+                client.CreateTableAsync(request).Wait();
+                Console.WriteLine("Created DynamoDB table: " + tableName);
             }
         }
 
-        private static string GetIp(string hostname)
-            => Dns.GetHostEntryAsync(hostname)
-                .Result
-                .AddressList
-                .First(a => a.AddressFamily == AddressFamily.InterNetwork)
-                .ToString();
-
-        private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+        private static void UpdateVote(AmazonDynamoDBClient client, string voterId, string vote)
         {
-            var command = connection.CreateCommand();
-            try
+            var table = Table.LoadTable(client, TableName);
+            var voteKey = $"POLL#cats-vs-dogs"; // Replace with your poll identifier
+            var userKey = $"USERID#{voterId}";
+
+            // Use DynamoDB transactions to ensure atomic operations
+            var transactWriteItems = new List<TransactWriteItem>
             {
-                command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
-                command.Parameters.AddWithValue("@id", voterId);
-                command.Parameters.AddWithValue("@vote", vote);
-                command.ExecuteNonQuery();
-            }
-            catch (DbException)
-            {
-                command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
-                command.ExecuteNonQuery();
-            }
-            finally
-            {
-                command.Dispose();
-            }
+                new TransactWriteItem
+                {
+                    Put = new Put
+                    {
+                        TableName = TableName,
+                        Item = new Dictionary<string, AttributeValue>
+                        {
+                            { "PK", new AttributeValue { S = voteKey } },
+                            { "SK", new AttributeValue { S = userKey } },
+                            { "vote", new AttributeValue { S = vote } }
+                        },
+                        ConditionExpression = "attribute_not_exists(PK)"
+                    }
+                },
+                new TransactWriteItem
+                {
+                    Update = new Update
+                    {
+                        TableName = TableName,
+                        Key = new Dictionary<string, AttributeValue>
+                        {
+                            { "PK", new AttributeValue { S = voteKey } },
+                            { "SK", new AttributeValue { S = $"VOTE#{vote}" } }
+                        },
+                        UpdateExpression = "ADD voteCount :increment",
+                        ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                        {
+                            { ":increment", new AttributeValue { N = "1" } }
+                        }
+                    }
+                }
+            };
+
+            // Execute the transaction
+            client.TransactWriteItemsAsync(new TransactWriteItemsRequest { TransactItems = transactWriteItems }).Wait();
+        }
+
+        private static void DeleteSqsMessage(string message)
+        {
+            // Implement your SQS message deletion logic here
+        }
+
+        private static string GetSqsMessage()
+        {
+            // Implement your SQS message fetching logic here
+            return null; // Placeholder return statement
+        }
+
+        // Define a class to represent a vote
+        public class Vote
+        {
+            public string VoterId { get; set; }
+            public string Vote { get; set; }
         }
     }
 }
