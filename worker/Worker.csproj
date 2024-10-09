@@ -6,9 +6,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="StackExchange.Redis" Version="2.2.4" />
-    <PackageReference Include="Npgsql" Version="4.1.9" />
+    <!-- Remove the old package references -->
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+    <!-- Add AWS SDK packages -->
+    <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.7.0.10" />
+    <PackageReference Include="AWSSDK.SQS" Version="3.7.0.10" />
   </ItemGroup>
 
 </Project>
